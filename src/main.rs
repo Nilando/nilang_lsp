@@ -58,7 +58,7 @@ impl LanguageServer for Backend {
                             text_document_registration_options: {
                                 TextDocumentRegistrationOptions {
                                     document_selector: Some(vec![DocumentFilter {
-                                        language: Some("l".to_string()),
+                                        language: Some("nilang".to_string()),
                                         scheme: Some("file".to_string()),
                                         pattern: None,
                                     }]),
@@ -68,7 +68,7 @@ impl LanguageServer for Backend {
                                 work_done_progress_options: WorkDoneProgressOptions::default(),
                                 legend: SemanticTokensLegend {
                                     token_types: vec![
-                                        SemanticTokenType::FUNCTION,
+                                        SemanticTokenType::KEYWORD,
                                         SemanticTokenType::VARIABLE,
                                         SemanticTokenType::PARAMETER,
                                         SemanticTokenType::STRUCT,
@@ -628,10 +628,10 @@ impl Backend {
     async fn on_change(&self, item: TextDocumentChange<'_>) {
         let rope = Rope::from(item.text);
         let mut symbol_map = SymbolMap::new();
-        let compile_result = parse_program(item.text, &mut symbol_map, Some(&item.uri));
+        let parse_result = parse_program(item.text, &mut symbol_map, Some(&item.uri));
 
-        let diagnostics = match &compile_result {
-            Ok(statements) => Vec::new(),
+        let diagnostics = match &parse_result {
+            Ok(_) => Vec::new(),
             Err(parse_error) => {
                 parse_error
                     .items
@@ -656,49 +656,6 @@ impl Backend {
             }
         };
 
-        //let mut diagnostics = compile_result
-        //    .diagnostics
-        //    .iter()
-        //    .flat_map(|d| {
-        //        d.labels.iter().filter_map(|label| {
-        //            let start = offset_to_position(label.range.start, &rope)?;
-        //            let end = offset_to_position(label.range.end, &rope)?;
-        //            let diag = Diagnostic {
-        //                range: Range::new(start, end),
-        //                severity: None,
-        //                code: None,
-        //                code_description: None,
-        //                source: None,
-        //                message: format!("{:?}", d.message),
-        //                related_information: None,
-        //                tags: None,
-        //                data: None,
-        //            };
-        //            Some(diag)
-        //        })
-        //    })
-        //    .collect::<Vec<_>>();
-
-        //compile_result.semantic.errors.iter().for_each(|sem_err| {
-        //    let span = sem_err.span;
-        //    let start = offset_to_position(span.start as usize, &rope);
-        //    let end = offset_to_position(span.end as usize, &rope);
-        //    if let (Some(start), Some(end)) = (start, end) {
-        //        let diag = Diagnostic {
-        //            range: Range::new(start, end),
-        //            severity: None,
-        //            code: None,
-        //            code_description: None,
-        //            source: None,
-        //            message: sem_err.message.to_string(),
-        //            related_information: None,
-        //            tags: None,
-        //            data: None,
-        //        };
-        //        diagnostics.push(diag);
-        //    }
-        //});
-
         let uri =
             Url::parse(&item.uri).unwrap_or_else(|_| Url::from_directory_path(&item.uri).unwrap());
 
@@ -707,184 +664,155 @@ impl Backend {
             .await;
 
         self.semanticast_map
-            .insert(item.uri.clone(), compile_result);
+            .insert(item.uri.clone(), parse_result);
 
         self.document_map.insert(item.uri.clone(), rope);
     }
 
     fn build_semantic_tokens(&self, uri: &str) -> Option<Vec<SemanticToken>> {
-        None // TODO
-        //let semantic_result = self.semanticast_map.get(uri)?;
-        //let rope = self.document_map.get(uri)?;
+        let parse_result = self.semanticast_map.get(uri)?;
+        let rope = self.document_map.get(uri)?;
 
-        //// Collect all tokens from symbols and references
-        //// Token type indices correspond to LEGEND_TYPE order:
-        //// 0: FUNCTION, 1: VARIABLE, 2: PARAMETER, 3: STRUCT, 4: PROPERTY (field)
-        //let mut incomplete_tokens: Vec<(usize, usize, u32)> = Vec::new(); // (start, length, token_type)
+        // Collect all tokens from symbols and references
+        // Token type indices correspond to LEGEND_TYPE order:
+        // 0: FUNCTION, 1: VARIABLE, 2: PARAMETER, 3: STRUCT, 4: PROPERTY (field)
+        let mut incomplete_tokens: Vec<(usize, usize, u32)> = Vec::new(); // (start, length, token_type)
 
-        //// Add symbol definitions
-        //for (symbol_id, span) in semantic_result.semantic.symbol_spans.iter_enumerated() {
-        //    let kind = semantic_result.semantic.get_symbol_kind(symbol_id);
-        //    let token_type = match kind {
-        //        SymbolKind::FUNCTION => 0,  // FUNCTION
-        //        SymbolKind::VARIABLE => 1,  // VARIABLE
-        //        SymbolKind::TYPE_PARAMETER => 2, // PARAMETER
-        //        SymbolKind::STRUCT => 3,    // STRUCT
-        //        SymbolKind::FIELD => 4,     // PROPERTY
-        //    };
-        //    incomplete_tokens.push((
-        //        span.start as usize,
-        //        (span.end - span.start) as usize,
-        //        token_type,
-        //    ));
-        //}
+        match &*parse_result {
+            Ok(stmts) => {
+                stmts.iter().for_each(|stmt| {
+                    match stmt {
+                        Stmt::Return(e) => {
+                            if let Some(expr) = e {
+                                let token_type = 0;
+                                incomplete_tokens.push((
+                                    expr.span.start as usize,
+                                    (expr.span.end - expr.span.start) as usize,
+                                    token_type,
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                })
 
-        //// Add references (they reference symbols, so use the symbol's kind)
-        //for (ref_id, span) in semantic_result.semantic.reference_spans.iter_enumerated() {
-        //    if let Some(symbol_id) = semantic_result.semantic.references[ref_id] {
-        //        let kind = semantic_result.semantic.get_symbol_kind(symbol_id);
-        //        let token_type = match kind {
-        //            SymbolKind::FUNCTION => 0,  // FUNCTION
-        //            SymbolKind::VARIABLE => 1,  // VARIABLE
-        //            SymbolKind::TYPE_PARAMETER => 2, // PARAMETER
-        //            SymbolKind::STRUCT => 3,    // STRUCT
-        //            SymbolKind::FIELD => 4,     // PROPERTY
-        //        };
-        //        incomplete_tokens.push((
-        //            span.start as usize,
-        //            (span.end - span.start) as usize,
-        //            token_type,
-        //        ));
-        //    }
-        //}
+            }
+            Err(_) => {}
+        }
 
-        //// Sort by start position
-        //incomplete_tokens.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sort by start position
+        incomplete_tokens.sort_by(|a, b| a.0.cmp(&b.0));
 
-        //// Convert to LSP SemanticToken format with delta encoding
-        //let mut pre_line: u32 = 0;
-        //let mut pre_start: u32 = 0;
+        // Convert to LSP SemanticToken format with delta encoding
+        let mut pre_line: u32 = 0;
+        let mut pre_start: u32 = 0;
 
-        //let semantic_tokens = incomplete_tokens
-        //    .iter()
-        //    .map(|(start, length, token_type)| {
-        //        // Convert byte offset to line and character
-        //        let line = rope.line_of_byte(*start) as u32;
-        //        let line_start_byte = rope.byte_of_line(line as usize);
-        //        let char_offset = *start - line_start_byte;
+        let semantic_tokens = incomplete_tokens
+            .iter()
+            .map(|(start, length, token_type)| {
+                // Convert byte offset to line and character
+                let line = rope.line_of_byte(*start) as u32;
+                let line_start_byte = rope.byte_of_line(line as usize);
+                let char_offset = *start - line_start_byte;
 
-        //        let delta_line = line - pre_line;
-        //        let delta_start = if delta_line == 0 {
-        //            char_offset as u32 - pre_start
-        //        } else {
-        //            char_offset as u32
-        //        };
+                let delta_line = line - pre_line;
+                let delta_start = if delta_line == 0 {
+                    char_offset as u32 - pre_start
+                } else {
+                    char_offset as u32
+                };
 
-        //        let token = SemanticToken {
-        //            delta_line,
-        //            delta_start,
-        //            length: *length as u32,
-        //            token_type: *token_type,
-        //            token_modifiers_bitset: 0,
-        //        };
+                let token = SemanticToken {
+                    delta_line,
+                    delta_start,
+                    length: *length as u32,
+                    token_type: *token_type,
+                    token_modifiers_bitset: 0,
+                };
 
-        //        pre_line = line;
-        //        pre_start = char_offset as u32;
+                pre_line = line;
+                pre_start = char_offset as u32;
 
-        //        token
-        //    })
-        //    .collect::<Vec<_>>();
+                token
+            })
+            .collect::<Vec<_>>();
 
-        //Some(semantic_tokens)
+        Some(semantic_tokens)
     }
 
     fn build_semantic_tokens_range(&self, uri: &str, range: Range) -> Option<Vec<SemanticToken>> {
-        None // TODO
-        //let semantic_result = self.semanticast_map.get(uri)?;
-        //let rope = self.document_map.get(uri)?;
+        let parse_result = self.semanticast_map.get(uri)?;
+        let rope = self.document_map.get(uri)?;
 
-        //// Convert range to byte offsets
-        //let start_offset = position_to_offset(range.start, &rope)?;
-        //let end_offset = position_to_offset(range.end, &rope)?;
+        // Convert range to byte offsets
+        let start_offset = position_to_offset(range.start, &rope)?;
+        let end_offset = position_to_offset(range.end, &rope)?;
 
-        //// Collect all tokens from symbols and references within the range
-        //let mut incomplete_tokens: Vec<(usize, usize, u32)> = Vec::new();
+        // Collect all tokens from symbols and references within the range
+        let mut incomplete_tokens: Vec<(usize, usize, u32)> = Vec::new();
 
-        //// Add symbol definitions within range
-        //for (symbol_id, span) in semantic_result.semantic.symbol_spans.iter_enumerated() {
-        //    let token_start = span.start as usize;
-        //    if token_start >= start_offset && token_start < end_offset {
-        //        let kind = semantic_result.semantic.get_symbol_kind(symbol_id);
-        //        let token_type = match kind {
-        //            SymbolKind::FUNCTION => 0,
-        //            SymbolKind::VARIABLE => 1,
-        //            SymbolKind::TYPE_PARAMETER => 2,
-        //            SymbolKind::STRUCT => 3,
-        //            SymbolKind::FIELD => 4,
-        //        };
-        //        incomplete_tokens.push((token_start, (span.end - span.start) as usize, token_type));
-        //    }
-        //}
+        match &*parse_result {
+            Ok(stmts) => {
+                stmts.iter().for_each(|stmt| {
+                    match stmt {
+                        Stmt::Return(e) => {
+                            if let Some(expr) = e {
+                                let token_start = expr.span.start as usize;
+                                if token_start >= start_offset && token_start < end_offset {
+                                    let token_type = 0;
+                                    incomplete_tokens.push((
+                                        expr.span.start as usize,
+                                        (expr.span.end - expr.span.start) as usize,
+                                        token_type,
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                })
 
-        //// Add references within range
-        //for (ref_id, span) in semantic_result.semantic.reference_spans.iter_enumerated() {
-        //    let token_start = span.start as usize;
-        //    if token_start >= start_offset && token_start < end_offset {
-        //        if let Some(symbol_id) = semantic_result.semantic.references[ref_id] {
-        //            let kind = semantic_result.semantic.get_symbol_kind(symbol_id);
-        //            let token_type = match kind {
-        //                SymbolKind::FUNCTION => 0,
-        //                SymbolKind::VARIABLE => 1,
-        //                SymbolKind::TYPE_PARAMETER => 2,
-        //                SymbolKind::STRUCT => 3,
-        //                SymbolKind::FIELD => 4,
-        //            };
-        //            incomplete_tokens.push((
-        //                token_start,
-        //                (span.end - span.start) as usize,
-        //                token_type,
-        //            ));
-        //        }
-        //    }
-        //}
+            }
+            Err(_) => {}
+        }
 
-        //// Sort by start position
-        //incomplete_tokens.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sort by start position
+        incomplete_tokens.sort_by(|a, b| a.0.cmp(&b.0));
 
-        //// Convert to LSP SemanticToken format with delta encoding
-        //let mut pre_line: u32 = 0;
-        //let mut pre_start: u32 = 0;
+        // Convert to LSP SemanticToken format with delta encoding
+        let mut pre_line: u32 = 0;
+        let mut pre_start: u32 = 0;
 
-        //let semantic_tokens = incomplete_tokens
-        //    .iter()
-        //    .map(|(start, length, token_type)| {
-        //        let line = rope.line_of_byte(*start) as u32;
-        //        let line_start_byte = rope.byte_of_line(line as usize);
-        //        let char_offset = *start - line_start_byte;
+        let semantic_tokens = incomplete_tokens
+            .iter()
+            .map(|(start, length, token_type)| {
+                let line = rope.line_of_byte(*start) as u32;
+                let line_start_byte = rope.byte_of_line(line as usize);
+                let char_offset = *start - line_start_byte;
 
-        //        let delta_line = line - pre_line;
-        //        let delta_start = if delta_line == 0 {
-        //            char_offset as u32 - pre_start
-        //        } else {
-        //            char_offset as u32
-        //        };
+                let delta_line = line - pre_line;
+                let delta_start = if delta_line == 0 {
+                    char_offset as u32 - pre_start
+                } else {
+                    char_offset as u32
+                };
 
-        //        let token = SemanticToken {
-        //            delta_line,
-        //            delta_start,
-        //            length: *length as u32,
-        //            token_type: *token_type,
-        //            token_modifiers_bitset: 0,
-        //        };
+                let token = SemanticToken {
+                    delta_line,
+                    delta_start,
+                    length: *length as u32,
+                    token_type: *token_type,
+                    token_modifiers_bitset: 0,
+                };
 
-        //        pre_line = line;
-        //        pre_start = char_offset as u32;
+                pre_line = line;
+                pre_start = char_offset as u32;
 
-        //        token
-        //    })
-        //    .collect::<Vec<_>>();
+                token
+            })
+            .collect::<Vec<_>>();
 
-        //Some(semantic_tokens)
+        Some(semantic_tokens)
     }
 }
 
