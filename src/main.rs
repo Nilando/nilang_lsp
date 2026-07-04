@@ -1,6 +1,6 @@
 use crop::Rope;
 use dashmap::DashMap;
-use nilang::{parse_program, ParseError, Stmt, SymbolMap};
+use nilang::{KeyWord, ParseError, ParseResult, Stmt, SymbolMap, Token, parse_program};
 use log::debug;
 use serde_json::Value;
 use tower_lsp::jsonrpc::{Result as JsonRPCResult};
@@ -11,7 +11,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 struct Backend {
     client: Client,
     document_map: DashMap<String, Rope>,
-    semanticast_map: DashMap<String, Result<Vec<Stmt>, ParseError>>,
+    semanticast_map: DashMap<String, ParseResult<Vec<Stmt>>>,
 }
 
 #[tower_lsp::async_trait]
@@ -67,13 +67,7 @@ impl LanguageServer for Backend {
                             semantic_tokens_options: SemanticTokensOptions {
                                 work_done_progress_options: WorkDoneProgressOptions::default(),
                                 legend: SemanticTokensLegend {
-                                    token_types: vec![
-                                        SemanticTokenType::KEYWORD,
-                                        SemanticTokenType::VARIABLE,
-                                        SemanticTokenType::PARAMETER,
-                                        SemanticTokenType::STRUCT,
-                                        SemanticTokenType::PROPERTY,
-                                    ],
+                                    token_types: token_types(),
                                     token_modifiers: vec![],
                                 },
                                 range: Some(true),
@@ -625,36 +619,33 @@ impl Backend {
         None // TODO
     }
 
+    // 1. Add more spans all across the AST parser
+    // 2. Add a method for flattening the AST into semantic tokens
+
     async fn on_change(&self, item: TextDocumentChange<'_>) {
         let rope = Rope::from(item.text);
         let mut symbol_map = SymbolMap::new();
-        let parse_result = parse_program(item.text, &mut symbol_map, Some(&item.uri));
+        let parse_result = parse_program(item.text, &mut symbol_map, Some(&item.uri), true);
 
-        let diagnostics = match &parse_result {
-            Ok(_) => Vec::new(),
-            Err(parse_error) => {
-                parse_error
-                    .items
-                    .iter()
-                    .filter_map(|err| {
-                        let start = offset_to_position(err.span.start, &rope)?;
-                        let end = offset_to_position(err.span.end, &rope)?;
-                        let diag = Diagnostic {
-                            range: Range::new(start, end),
-                            severity: None,
-                            code: None,
-                            code_description: None,
-                            source: None,
-                            message: format!("{:?}", err.item.render()),
-                            related_information: None,
-                            tags: None,
-                            data: None,
-                        };
-                        Some(diag)
-                    })
-                    .collect::<Vec<_>>()
-            }
-        };
+        let diagnostics = parse_result.errors
+            .iter()
+            .filter_map(|err| {
+                let start = offset_to_position(err.span.start, &rope)?;
+                let end = offset_to_position(err.span.end, &rope)?;
+                let diag = Diagnostic {
+                    range: Range::new(start, end),
+                    severity: None,
+                    code: None,
+                    code_description: None,
+                    source: None,
+                    message: format!("{:?}", err.item.render()),
+                    related_information: None,
+                    tags: None,
+                    data: None,
+                };
+                Some(diag)
+            })
+            .collect::<Vec<_>>();
 
         let uri =
             Url::parse(&item.uri).unwrap_or_else(|_| Url::from_directory_path(&item.uri).unwrap());
@@ -678,27 +669,13 @@ impl Backend {
         // 0: FUNCTION, 1: VARIABLE, 2: PARAMETER, 3: STRUCT, 4: PROPERTY (field)
         let mut incomplete_tokens: Vec<(usize, usize, u32)> = Vec::new(); // (start, length, token_type)
 
-        match &*parse_result {
-            Ok(stmts) => {
-                stmts.iter().for_each(|stmt| {
-                    match stmt {
-                        Stmt::Return(e) => {
-                            if let Some(expr) = e {
-                                let token_type = 0;
-                                incomplete_tokens.push((
-                                    expr.span.start as usize,
-                                    (expr.span.end - expr.span.start) as usize,
-                                    token_type,
-                                ));
-                            }
-                        }
-                        _ => {}
-                    }
-                })
-
-            }
-            Err(_) => {}
-        }
+        parse_result.tokens.iter().for_each(|token| {
+            incomplete_tokens.push((
+                token.span.start as usize,
+                (token.span.end - token.span.start) as usize,
+                token_to_token_type(&token.item),
+            ));
+        });
 
         // Sort by start position
         incomplete_tokens.sort_by(|a, b| a.0.cmp(&b.0));
@@ -751,30 +728,16 @@ impl Backend {
         // Collect all tokens from symbols and references within the range
         let mut incomplete_tokens: Vec<(usize, usize, u32)> = Vec::new();
 
-        match &*parse_result {
-            Ok(stmts) => {
-                stmts.iter().for_each(|stmt| {
-                    match stmt {
-                        Stmt::Return(e) => {
-                            if let Some(expr) = e {
-                                let token_start = expr.span.start as usize;
-                                if token_start >= start_offset && token_start < end_offset {
-                                    let token_type = 0;
-                                    incomplete_tokens.push((
-                                        expr.span.start as usize,
-                                        (expr.span.end - expr.span.start) as usize,
-                                        token_type,
-                                    ));
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                })
-
+        parse_result.tokens.iter().for_each(|token| {
+            let token_start = token.span.start as usize;
+            if token_start >= start_offset && token_start < end_offset {
+                incomplete_tokens.push((
+                    token.span.start as usize,
+                    (token.span.end - token.span.start) as usize,
+                    token_to_token_type(&token.item),
+                ));
             }
-            Err(_) => {}
-        }
+        });
 
         // Sort by start position
         incomplete_tokens.sort_by(|a, b| a.0.cmp(&b.0));
@@ -837,4 +800,33 @@ fn position_to_offset(position: Position, rope: &Rope) -> Option<usize> {
     }
     let line_byte_offset = rope.byte_of_line(position.line as usize);
     Some(line_byte_offset + position.character as usize)
+}
+
+fn token_types() -> Vec<SemanticTokenType> {
+    vec![
+        SemanticTokenType::VARIABLE,
+        SemanticTokenType::KEYWORD,
+        SemanticTokenType::STRING,
+        SemanticTokenType::NUMBER,
+        SemanticTokenType::OPERATOR,
+    ]
+}
+
+fn token_to_token_type(token: &Token) -> u32 {
+    match token {
+        nilang::Token::Ident(_) => 0,
+        nilang::Token::KeyWord(keyword) => match keyword {
+            _ => 1
+        },
+        nilang::Token::String(_) => 2,
+        nilang::Token::Int(_) | nilang::Token::Float(_) => 3,
+        nilang::Token::Ctrl(ctrl) => {
+            if ctrl.is_op() {
+                4
+            } else {
+                999
+            }
+        }
+        _ => 999
+    }
 }
