@@ -1,6 +1,6 @@
 use crop::Rope;
 use dashmap::DashMap;
-use nilang::{KeyWord, ParseError, ParseResult, Stmt, SymbolMap, Token, parse_program};
+use nilang::{Expr, KeyWord, LhsExpr, MapKey, ParseError, ParseResult, ParseValue, SELF_SYM, Span, Stmt, SymbolMap, Token, parse_program};
 use log::debug;
 use serde_json::Value;
 use tower_lsp::jsonrpc::{Result as JsonRPCResult};
@@ -68,7 +68,7 @@ impl LanguageServer for Backend {
                                 work_done_progress_options: WorkDoneProgressOptions::default(),
                                 legend: SemanticTokensLegend {
                                     token_types: token_types(),
-                                    token_modifiers: vec![],
+                                    token_modifiers: token_mods(),
                                 },
                                 range: Some(true),
                                 full: Some(SemanticTokensFullOptions::Bool(true)),
@@ -667,15 +667,24 @@ impl Backend {
         // Collect all tokens from symbols and references
         // Token type indices correspond to LEGEND_TYPE order:
         // 0: FUNCTION, 1: VARIABLE, 2: PARAMETER, 3: STRUCT, 4: PROPERTY (field)
-        let mut incomplete_tokens: Vec<(usize, usize, u32)> = Vec::new(); // (start, length, token_type)
+        let mut incomplete_tokens: Vec<(usize, usize, u32, u32)> = Vec::new(); // (start, length, token_type)
 
         parse_result.tokens.iter().for_each(|token| {
+            let sem_tok = token_to_token_type(&token.item);
+
             incomplete_tokens.push((
                 token.span.start as usize,
                 (token.span.end - token.span.start) as usize,
-                token_to_token_type(&token.item),
+                sem_tok.0,
+                sem_tok.1,
             ));
         });
+
+        if let Some(stmts) = &parse_result.item {
+            stmts.iter().for_each(|stmt| {
+                visit_stmt(stmt, &mut incomplete_tokens, None);
+            });
+        }
 
         // Sort by start position
         incomplete_tokens.sort_by(|a, b| a.0.cmp(&b.0));
@@ -686,7 +695,7 @@ impl Backend {
 
         let semantic_tokens = incomplete_tokens
             .iter()
-            .map(|(start, length, token_type)| {
+            .map(|(start, length, token_type, token_mod)| {
                 // Convert byte offset to line and character
                 let line = rope.line_of_byte(*start) as u32;
                 let line_start_byte = rope.byte_of_line(line as usize);
@@ -704,7 +713,7 @@ impl Backend {
                     delta_start,
                     length: *length as u32,
                     token_type: *token_type,
-                    token_modifiers_bitset: 0,
+                    token_modifiers_bitset: *token_mod,
                 };
 
                 pre_line = line;
@@ -726,18 +735,28 @@ impl Backend {
         let end_offset = position_to_offset(range.end, &rope)?;
 
         // Collect all tokens from symbols and references within the range
-        let mut incomplete_tokens: Vec<(usize, usize, u32)> = Vec::new();
+        let mut incomplete_tokens: Vec<(usize, usize, u32, u32)> = Vec::new();
 
         parse_result.tokens.iter().for_each(|token| {
             let token_start = token.span.start as usize;
             if token_start >= start_offset && token_start < end_offset {
+
+                let sem_tok = token_to_token_type(&token.item);
                 incomplete_tokens.push((
                     token.span.start as usize,
                     (token.span.end - token.span.start) as usize,
-                    token_to_token_type(&token.item),
+                    sem_tok.0,
+                    sem_tok.1,
                 ));
             }
         });
+
+
+        if let Some(stmts) = &parse_result.item {
+            stmts.iter().for_each(|stmt| {
+                visit_stmt(stmt, &mut incomplete_tokens, Some((start_offset, end_offset)));
+            });
+        }
 
         // Sort by start position
         incomplete_tokens.sort_by(|a, b| a.0.cmp(&b.0));
@@ -748,7 +767,7 @@ impl Backend {
 
         let semantic_tokens = incomplete_tokens
             .iter()
-            .map(|(start, length, token_type)| {
+            .map(|(start, length, token_type, token_mod)| {
                 let line = rope.line_of_byte(*start) as u32;
                 let line_start_byte = rope.byte_of_line(line as usize);
                 let char_offset = *start - line_start_byte;
@@ -765,7 +784,7 @@ impl Backend {
                     delta_start,
                     length: *length as u32,
                     token_type: *token_type,
-                    token_modifiers_bitset: 0,
+                    token_modifiers_bitset: *token_mod,
                 };
 
                 pre_line = line;
@@ -779,6 +798,176 @@ impl Backend {
     }
 }
 
+fn visit_stmt(stmt: &Stmt, tokens: &mut Vec<(usize, usize, u32, u32)>, range: Option<(usize, usize)>) {
+    match stmt {
+        Stmt::Expr(expr) | Stmt::Return(Some(expr)) => {
+            visit_expr(&expr.item, tokens, range);
+        }
+        Stmt::If { cond, stmts } | Stmt::While { cond, stmts } => {
+            visit_expr(&cond.item, tokens, range);
+
+            for stmt in stmts.iter() {
+                visit_stmt(&stmt, tokens, range);
+            }
+        }
+        Stmt::IfElse { cond, stmts, else_stmts } => {
+            visit_expr(&cond.item, tokens, range);
+
+            for stmt in stmts.iter() {
+                visit_stmt(&stmt, tokens, range);
+            }
+
+            for stmt in else_stmts.iter() {
+                visit_stmt(&stmt, tokens, range);
+            }
+        }
+        Stmt::Assign { dest, src } => {
+            match &dest.item {
+                LhsExpr::Index { store, key } => {
+                    visit_expr(&store.item, tokens, range);
+                    visit_expr(&key.item, tokens, range);
+                }
+                LhsExpr::Access { store, key } => {
+                    visit_expr(&store.item, tokens, range);
+                    tokens.push((
+                        key.span.start as usize,
+                        (key.span.end - key.span.start) as usize,
+                        7,
+                        0,
+                    ));
+                }
+                _ => {}
+            }
+
+            visit_expr(&src.item, tokens, range);
+        }
+        Stmt::FuncDecl { ident, inputs, stmts }=> {
+            tokens.push((
+                ident.span.start as usize,
+                (ident.span.end - ident.span.start) as usize,
+                6,
+                0,
+            ));
+
+            for stmt in stmts.iter() {
+                visit_stmt(&stmt, tokens, range);
+            }
+        }
+        Stmt::ForLoop { item, store, stmts } => {
+            visit_expr(&store.item, tokens, range);
+            for stmt in stmts.iter() {
+                visit_stmt(&stmt, tokens, range);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn visit_expr(expr: &Expr, tokens: &mut Vec<(usize, usize, u32, u32)>, range: Option<(usize, usize)>) {
+    match expr {
+        Expr::Call { calle, args } => {
+            if let Some(range) = range {
+                let token_start = calle.span.start as usize;
+                if token_start < range.0 || token_start >= range.1 {
+                    return;
+                }
+            }
+
+            match &calle.item {
+                Expr::Access { store, key } => {
+                    tokens.push((
+                        key.span.start as usize,
+                        (key.span.end - key.span.start) as usize,
+                        8,
+                        0,
+                    ));
+                    visit_expr(&store.item, tokens, range);
+                }
+                Expr::Value(_) => {
+                    tokens.push((
+                        calle.span.start as usize,
+                        (calle.span.end - calle.span.start) as usize,
+                        6,
+                        0,
+                    ));
+                }
+                _ => visit_expr(&calle.item, tokens, range),
+            }
+
+            for arg in args.iter() {
+                visit_expr(&arg.item, tokens, range);
+            }
+        }
+        Expr::Access { store, key } => {
+            if let Some(range) = range {
+                let token_start = store.span.start as usize;
+                if token_start < range.0 || token_start >= range.1 {
+                    return;
+                }
+            }
+
+            visit_expr(&store.item, tokens, range);
+
+            tokens.push((
+                key.span.start as usize,
+                (key.span.end - key.span.start) as usize,
+                7,
+                0,
+            ));
+        }
+        Expr::Index { store, key } | Expr::Delete { store, key } => {
+            if let Some(range) = range {
+                let token_start = store.span.start as usize;
+                if token_start < range.0 || token_start >= range.1 {
+                    return;
+                }
+            }
+
+            visit_expr(&store.item, tokens, range);
+            visit_expr(&key.item, tokens, range);
+        }
+        Expr::Unaop { expr, .. } | Expr::Print(expr) | Expr::Type(expr) | Expr::Clone(expr) | Expr::Import(expr) => {
+            visit_expr(&expr.item, tokens, range);
+        }
+        Expr::Value(value) => {
+            match value {
+                ParseValue::InlineFunc { inputs, stmts } => {
+                    for stmt in stmts.iter() {
+                        visit_stmt(&stmt, tokens, range);
+                    }
+                }
+                ParseValue::List(exprs) => {
+                    for expr in exprs.iter() {
+                        visit_expr(&expr.item, tokens, range);
+                    }
+                }
+                ParseValue::Map(key_values) => {
+                    for kv in key_values.iter() {
+                        let key = &kv.0;
+                        let value = &kv.1;
+
+                        match key {
+                            MapKey::Sym(sym) => {
+                                // TODO: maybe mark these as properties?
+                            }
+                            MapKey::Expr(expr) => {
+                                visit_expr(&expr.item, tokens, range);
+                            }
+                        }
+
+                        visit_expr(&value.item, tokens, range);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Expr::Binop { lhs, op, rhs } => {
+            visit_expr(&lhs.item, tokens, range);
+            visit_expr(&rhs.item, tokens, range);
+        }
+        _ => {}
+    }
+}
 struct TextDocumentChange<'a> {
     uri: String,
     text: &'a str,
@@ -809,24 +998,43 @@ fn token_types() -> Vec<SemanticTokenType> {
         SemanticTokenType::STRING,
         SemanticTokenType::NUMBER,
         SemanticTokenType::OPERATOR,
+        SemanticTokenType::ENUM_MEMBER,
+        SemanticTokenType::FUNCTION,
+        SemanticTokenType::PROPERTY,
+        SemanticTokenType::METHOD,
+        SemanticTokenType::new("selfKeyword"),
     ]
 }
 
-fn token_to_token_type(token: &Token) -> u32 {
+fn token_mods() -> Vec<SemanticTokenModifier> {
+    vec![
+        SemanticTokenModifier::STATIC,
+    ]
+}
+
+fn token_to_token_type(token: &Token) -> (u32, u32) {
     match token {
-        nilang::Token::Ident(_) => 0,
-        nilang::Token::KeyWord(keyword) => match keyword {
-            _ => 1
-        },
-        nilang::Token::String(_) => 2,
-        nilang::Token::Int(_) | nilang::Token::Float(_) => 3,
-        nilang::Token::Ctrl(ctrl) => {
-            if ctrl.is_op() {
-                4
+        nilang::Token::Ident(sym) => {
+            if *sym == SELF_SYM {
+                (9, 0)
             } else {
-                999
+                (999, 0)
             }
         }
-        _ => 999
+        nilang::Token::KeyWord(keyword) => match keyword {
+            _ => (1, 0)
+        },
+        nilang::Token::String(_) => (2, 0),
+        nilang::Token::Int(_) | nilang::Token::Float(_) => (3, 0),
+        nilang::Token::Ctrl(ctrl) => {
+            if ctrl.is_op() {
+                (4, 0)
+            } else {
+                (999, 0)
+            }
+        }
+        nilang::Token::Global(_) => (0, 1),
+        nilang::Token::Sym(_) => (5, 0),
+        _ => (999, 0)
     }
 }
